@@ -27,8 +27,11 @@ from Models import (
 )
 import json
 import uuid
+import asyncio # Added import
 from datetime import datetime
 from MagicalAuth import MagicalAuth, get_user_id
+from agixt.app import task_manager # Added import - assuming task_manager is in agixt.app
+from fastapi import APIRouter, Depends, Header, HTTPException # Ensured HTTPException is imported
 
 app = APIRouter()
 
@@ -521,3 +524,38 @@ async def get_notifications(user=Depends(verify_api_key)):
     c = Conversations(user=user)
     notifications = c.get_notifications()
     return {"notifications": notifications}
+
+
+@app.post(
+    "/v1/conversation/{conversation_id}/stop",
+    response_model=ResponseMessage,
+    summary="Stop Conversation Generation",
+    description="Attempts to stop any active AI generation for the specified conversation.",
+    tags=["Conversation"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def stop_conversation_generation(
+    conversation_id: str, user=Depends(verify_api_key)
+) -> ResponseMessage:
+    """
+    Endpoint to stop active AI generation for a conversation.
+    It uses the ActiveTaskManager to cancel the task associated with the conversation_id.
+    """
+    try:
+        cancelled = await task_manager.cancel_task(conversation_id)
+        if cancelled:
+            return ResponseMessage(
+                message=f"Successfully requested to stop generation for conversation {conversation_id}."
+            )
+        else:
+            # Task not found or already completed/cancelled
+            return ResponseMessage(
+                message=f"No active generation found for conversation {conversation_id}, or it might have already completed or been cancelled."
+            )
+    except Exception as e:
+        # Log the exception for debugging purposes
+        # logger.error(f"Error stopping conversation {conversation_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while trying to stop generation for conversation {conversation_id}.",
+        )

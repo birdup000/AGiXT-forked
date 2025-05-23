@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from Workspaces import WorkspaceManager
 from typing import Optional
 from TaskMonitor import TaskMonitor
+from agixt.active_task_manager import ActiveTaskManager # Added import
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -39,25 +40,29 @@ logging.basicConfig(
 )
 workspace_manager = WorkspaceManager()
 task_monitor = TaskMonitor()
+task_manager = ActiveTaskManager() # Instantiated ActiveTaskManager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     workspace_manager.start_file_watcher()
     await task_monitor.start()
-
+    # No startup needed for task_manager based on current implementation
     try:
         yield
     finally:
         # Shutdown
         workspace_manager.stop_file_watcher()
         await task_monitor.stop()
+        # No explicit shutdown needed for task_manager based on current implementation
+        # (e.g., task_manager.shutdown() if it had resources to release)
 
 
 # Register signal handlers for unexpected shutdowns
 async def cleanup():
     workspace_manager.stop_file_watcher()
     await task_monitor.stop()
+    # No explicit cleanup needed for task_manager here either
 
 
 def signal_handler(signum, frame):

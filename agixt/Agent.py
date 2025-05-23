@@ -643,16 +643,22 @@ class Agent:
                 answer = await self.PROVIDER.inference(
                     prompt=prompt, tokens=input_tokens, images=images
                 )
-            output_tokens = get_tokens(answer)
-            self.auth.increase_token_counts(
-                input_tokens=input_tokens, output_tokens=output_tokens
-            )
-            answer = str(answer).replace("\_", "_")
-            if answer.endswith("\n\n"):
-                answer = answer[:-2]
+        except asyncio.CancelledError:
+            logging.info(f"Task cancelled during provider inference for agent {self.agent_name} in Agent.inference")
+            raise # Re-raise to propagate cancellation
         except Exception as e:
             logging.error(f"Error in inference: {str(e)}")
             answer = "<answer>Unable to process request.</answer>"
+            # It's important to return here if an error occurs, not proceed
+            return answer 
+        
+        output_tokens = get_tokens(answer)
+        self.auth.increase_token_counts(
+            input_tokens=input_tokens, output_tokens=output_tokens
+        )
+        answer = str(answer).replace("\_", "_")
+        if answer.endswith("\n\n"):
+            answer = answer[:-2]
         return answer
 
     async def vision_inference(
@@ -670,19 +676,25 @@ class Agent:
                     prompt=prompt, tokens=input_tokens, images=images, use_smartest=True
                 )
             else:
-                answer = await self.PROVIDER.inference(
+                # Assuming VISION_PROVIDER uses the same .inference() method structure
+                answer = await self.VISION_PROVIDER.inference( 
                     prompt=prompt, tokens=input_tokens, images=images
                 )
-            output_tokens = get_tokens(answer)
-            self.auth.increase_token_counts(
-                input_tokens=input_tokens, output_tokens=output_tokens
-            )
-            answer = str(answer).replace("\_", "_")
-            if answer.endswith("\n\n"):
-                answer = answer[:-2]
+        except asyncio.CancelledError:
+            logging.info(f"Task cancelled during vision provider inference for agent {self.agent_name} in Agent.vision_inference")
+            raise # Re-raise to propagate cancellation
         except Exception as e:
-            logging.error(f"Error in inference: {str(e)}")
-            answer = "<answer>Unable to process request.</answer>"
+            logging.error(f"Error in vision_inference: {str(e)}")
+            answer = "<answer>Unable to process request for vision.</answer>"
+            return answer
+
+        output_tokens = get_tokens(answer)
+        self.auth.increase_token_counts(
+            input_tokens=input_tokens, output_tokens=output_tokens
+        )
+        answer = str(answer).replace("\_", "_")
+        if answer.endswith("\n\n"):
+            answer = answer[:-2]
         return answer
 
     def embeddings(self, input) -> np.ndarray:
@@ -691,13 +703,37 @@ class Agent:
         return embed(input=input)
 
     async def transcribe_audio(self, audio_path: str):
-        return await self.TRANSCRIPTION_PROVIDER.transcribe_audio(audio_path=audio_path)
+        try:
+            return await self.TRANSCRIPTION_PROVIDER.transcribe_audio(audio_path=audio_path)
+        except asyncio.CancelledError:
+            logging.info(f"Task cancelled during audio transcription for agent {self.agent_name}")
+            raise
+        except Exception as e:
+            logging.error(f"Error in transcribe_audio: {str(e)}")
+            return "Audio transcription failed."
+
 
     async def translate_audio(self, audio_path: str):
-        return await self.TRANSLATION_PROVIDER.translate_audio(audio_path=audio_path)
+        try:
+            return await self.TRANSLATION_PROVIDER.translate_audio(audio_path=audio_path)
+        except asyncio.CancelledError:
+            logging.info(f"Task cancelled during audio translation for agent {self.agent_name}")
+            raise
+        except Exception as e:
+            logging.error(f"Error in translate_audio: {str(e)}")
+            return "Audio translation failed."
 
     async def generate_image(self, prompt: str):
-        return await self.IMAGE_PROVIDER.generate_image(prompt=prompt)
+        try:
+            return await self.IMAGE_PROVIDER.generate_image(prompt=prompt)
+        except asyncio.CancelledError:
+            logging.info(f"Task cancelled during image generation for agent {self.agent_name}")
+            raise
+        except Exception as e:
+            logging.error(f"Error in generate_image: {str(e)}")
+            # Consider returning an error placeholder URL or message
+            return "Image generation failed."
+
 
     async def text_to_speech(self, text: str):
         if self.TTS_PROVIDER is not None:
@@ -720,7 +756,15 @@ class Agent:
                     "The link provided in the chat.",
                     text,
                 )
-            tts_content = await self.TTS_PROVIDER.text_to_speech(text=text)
+            try:
+                tts_content = await self.TTS_PROVIDER.text_to_speech(text=text)
+            except asyncio.CancelledError:
+                logging.info(f"Task cancelled during text to speech generation for agent {self.agent_name}")
+                raise # Re-raise to propagate cancellation
+            except Exception as e:
+                logging.error(f"Error in text_to_speech generation: {str(e)}")
+                return None # Or some error indicator
+
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
             filename = f"{self.agent_id}_{timestamp}.wav"
             audio_path = os.path.join(self.working_directory, filename)

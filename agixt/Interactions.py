@@ -797,11 +797,18 @@ class Interactions:
             self.response = await self.agent.inference(
                 prompt=formatted_prompt, use_smartest=use_smartest
             )
+        except asyncio.CancelledError:
+            logging.info(f"Task cancelled during agent inference for agent {self.agent_name} in Interactions.run")
+            raise # Re-raise to propagate cancellation
         except Exception as e:
             # Log the error with the full traceback for the provider
             error = ""
-            for err in e:
-                error += f"{err.args}\n{err.name}\n{err.msg}\n"
+            # Assuming e might be a list of errors or a single error object
+            if isinstance(e, list):
+                for err_item in e:
+                    error += f"{err_item.args}\n{err_item.name}\n{err_item.msg}\n"
+            else: # Assuming it's a single exception object
+                 error = str(e)
             # logging.warning(f"TOKENS: {tokens} PROMPT CONTENT: {formatted_prompt}")
             logging.error(f"{self.agent.PROVIDER} Error: {error} TOKENS: {tokens}")
             c.log_interaction(
@@ -916,16 +923,24 @@ class Interactions:
                     )
                 # First handle any initial commands
                 if "<execute>" in self.response:
-                    await self.execution_agent(conversation_name=conversation_name)
+                    try:
+                        await self.execution_agent(conversation_name=conversation_name)
+                    except asyncio.CancelledError:
+                        logging.info(f"Task cancelled during execution_agent call for agent {self.agent_name} from Interactions.run")
+                        raise # Re-raise to propagate cancellation
                     new_processed_length = len(self.response)
                     if new_processed_length > processed_length:
                         # Get continuation only if we got new content
                         # Make the context about command execution clearer
                         command_output = self.response[processed_length:].strip()
                         new_prompt = f"{formatted_prompt}\n\n{self.agent_name}: {self.response[:processed_length]}\n\nCommand executed with output: {command_output}\n\nThe assistant should continue its thought process based on this command output..."
-                        command_response = await self.agent.inference(
-                            prompt=new_prompt, use_smartest=use_smartest
-                        )
+                        try:
+                            command_response = await self.agent.inference(
+                                prompt=new_prompt, use_smartest=use_smartest
+                            )
+                        except asyncio.CancelledError:
+                            logging.info(f"Task cancelled during agent inference (after command execution) for agent {self.agent_name} in Interactions.run")
+                            raise # Re-raise to propagate cancellation
                         self.response = f"{self.response}{command_response}"
                         processed_length = new_processed_length
                     else:
@@ -952,15 +967,23 @@ class Interactions:
                         self.response = self.process_thinking_tags(
                             response=self.response, thinking_id=thinking_id, c=c
                         )
-                    await self.execution_agent(conversation_name=conversation_name)
+                    try:
+                        await self.execution_agent(conversation_name=conversation_name)
+                    except asyncio.CancelledError:
+                        logging.info(f"Task cancelled during execution_agent call (main loop) for agent {self.agent_name} from Interactions.run")
+                        raise # Re-raise to propagate cancellation
                     new_processed_length = len(self.response)
 
                     if new_processed_length > processed_length:
                         # Only continue if we actually got new content
                         new_prompt = f"{formatted_prompt}\n\n{self.agent_name}: {self.response}\n\nThe assistant has executed a command and should continue its thought process, the user does not see this message. Proceed with thinking, responding, or executing more commands before the response to the user. This can be used also to evaluate output of previously executed commands and retry executing a command if the output of the command was not as expected. The assistant should never try to fill in the command output, it will be returned to the assistant after the command is executed by the system. Ensure the <answer> block does not contain <thinking>, <reflection>, <execute>, or <output> tags, those should only exist before and after the <answer> block. The <answer> block should only contain the final, well reasoned response to the user."
-                        command_response = await self.agent.inference(
-                            prompt=new_prompt, use_smartest=use_smartest
-                        )
+                        try:
+                            command_response = await self.agent.inference(
+                                prompt=new_prompt, use_smartest=use_smartest
+                            )
+                        except asyncio.CancelledError:
+                            logging.info(f"Task cancelled during agent inference (after command execution, main loop) for agent {self.agent_name} in Interactions.run")
+                            raise # Re-raise to propagate cancellation
                         self.response = f"{self.response}{command_response}"
                         processed_length = new_processed_length
                         # Check for new thinking tags after getting new content
@@ -977,10 +1000,14 @@ class Interactions:
                 # If no answer block yet, try to get it
                 elif "</answer>" not in self.response:
                     new_prompt = f"{formatted_prompt}\n\n{self.agent_name}: {self.response}\n\nWas the assistant {self.agent_name} done typing? If not, continue from where you left off without acknowledging this message or repeating anything that was already typed and the response will be appended. If the assistant needs to rewrite the response, start a new <answer> tag with the new response and close it with </answer> when complete. If the assistant was done, simply respond with '</answer>' as long as there is a <answer> block present, otherwise, the final answer to the user should be within the <answer> block. to send the message to the user. Ensure the <answer> block does not contain <thinking>, <reflection>, <execute>, or <output> tags, those should only exist before and after the <answer> block. The <answer> block should only contain the final, well reasoned response to the user."
-                    response = await self.agent.inference(
-                        prompt=new_prompt, use_smartest=use_smartest
-                    )
-                    self.response = f"{self.response}{response}"
+                    try:
+                        response_continuation = await self.agent.inference(
+                            prompt=new_prompt, use_smartest=use_smartest
+                        )
+                    except asyncio.CancelledError:
+                        logging.info(f"Task cancelled during agent inference (continuation) for agent {self.agent_name} in Interactions.run")
+                        raise # Re-raise to propagate cancellation
+                    self.response = f"{self.response}{response_continuation}"
                     continue
                 else:
                     # We have an answer block - check if there are unprocessed commands before it
@@ -990,7 +1017,11 @@ class Interactions:
                         and "</output>" not in pre_answer.split("<execute>")[-1]
                     ):
                         # There's an unprocessed command before the answer block
-                        await self.execution_agent(conversation_name=conversation_name)
+                        try:
+                            await self.execution_agent(conversation_name=conversation_name)
+                        except asyncio.CancelledError:
+                            logging.info(f"Task cancelled during execution_agent call (pre-answer check) for agent {self.agent_name} in Interactions.run")
+                            raise # Re-raise to propagate cancellation
                         new_processed_length = len(self.response)
                         if new_processed_length > processed_length:
                             # Continue processing if we got new content
@@ -1220,74 +1251,81 @@ class Interactions:
         logging.debug(f"Commands to execute: {commands_to_execute}")
         reformatted_response = self.response
         if commands_to_execute:
-            for command_block, command_name, command_args in commands_to_execute:
-                position = self.response.index(command_block)
-                command_id = f"{position}:{command_name}:{json.dumps(command_args, sort_keys=True)}"
-                # Skip if we've already processed this exact command
-                if command_id in self._processed_commands:
-                    logging.debug(f"Skipping duplicate command: {command_id}")
-                    continue
+            try:
+                for command_block, command_name, command_args in commands_to_execute:
+                    position = self.response.index(command_block)
+                    command_id = f"{position}:{command_name}:{json.dumps(command_args, sort_keys=True)}"
+                    # Skip if we've already processed this exact command
+                    if command_id in self._processed_commands:
+                        logging.debug(f"Skipping duplicate command: {command_id}")
+                        continue
 
-                # Mark this command as processed
-                self._processed_commands.add(command_id)
-                logging.info(f"Command to execute: {command_name}")
-                logging.info(f"Command Args: {command_args}")
+                    # Mark this command as processed
+                    self._processed_commands.add(command_id)
+                    logging.info(f"Command to execute: {command_name}")
+                    logging.info(f"Command Args: {command_args}")
 
-                command_output = ""
-                if command_name.strip().lower() not in [
-                    cmd.lower() for cmd in command_list
-                ]:
-                    command_output = f"Unknown command: {command_name}"
-                    logging.warning(command_output)
-                else:
-                    try:
-                        json_args = json.dumps(command_args, indent=2)
-                        c.log_interaction(
-                            role=self.agent_name,
-                            message=f"[SUBACTIVITY][{thinking_id}][EXECUTION] Executing `{command_name}`.\n```json\n{json_args}```",
-                        )
-                        ext = Extensions(
-                            agent_name=self.agent_name,
-                            agent_id=self.agent.agent_id,
-                            agent_config=self.agent.AGENT_CONFIG,
-                            conversation_name=conversation_name,
-                            conversation_id=c.get_conversation_id(),
-                            ApiClient=self.ApiClient,
-                            api_key=self.ApiClient.headers["Authorization"],
-                            user=self.user,
-                        )
-                        command_args["activity_id"] = thinking_id
-                        command_output = await ext.execute_command(
-                            command_name=command_name,
-                            command_args=command_args,
-                        )
-                        c.log_interaction(
-                            role=self.agent_name,
-                            message=f"[SUBACTIVITY][{thinking_id}][EXECUTION] `{command_name}` was executed successfully.\n{command_output}",
-                        )
-                        logging.info(f"Command output: {command_output}")
-                    except Exception as e:
-                        error_message = f"Error: {self.agent_name} failed to execute command `{command_name}`. {e}"
-                        logging.error(error_message)
-                        c.log_interaction(
-                            role=self.agent_name,
-                            message=f"[SUBACTIVITY][{thinking_id}][ERROR] Failed to execute command `{command_name}`.\n{error_message}",
-                        )
-                        command_output = error_message
-                # Format the command execution and output
-                formatted_execution = (
-                    f"<execute>\n"
-                    f"<name>{command_name}</name>\n"
-                    f"{chr(10).join([f'<{k}>{v}</{k}>' for k, v in command_args.items()])}\n"
-                    f"</execute>\n"
-                    f"<output>{command_output}</output>"
-                )
+                    command_output = ""
+                    if command_name.strip().lower() not in [
+                        cmd.lower() for cmd in command_list
+                    ]:
+                        command_output = f"Unknown command: {command_name}"
+                        logging.warning(command_output)
+                    else:
+                        try:
+                            json_args = json.dumps(command_args, indent=2)
+                            c.log_interaction(
+                                role=self.agent_name,
+                                message=f"[SUBACTIVITY][{thinking_id}][EXECUTION] Executing `{command_name}`.\n```json\n{json_args}```",
+                            )
+                            ext = Extensions(
+                                agent_name=self.agent_name,
+                                agent_id=self.agent.agent_id,
+                                agent_config=self.agent.AGENT_CONFIG,
+                                conversation_name=conversation_name,
+                                conversation_id=c.get_conversation_id(),
+                                ApiClient=self.ApiClient,
+                                api_key=self.ApiClient.headers["Authorization"],
+                                user=self.user,
+                            )
+                            command_args["activity_id"] = thinking_id
+                            command_output = await ext.execute_command( # This is an awaitable call
+                                command_name=command_name,
+                                command_args=command_args,
+                            )
+                            c.log_interaction(
+                                role=self.agent_name,
+                                message=f"[SUBACTIVITY][{thinking_id}][EXECUTION] `{command_name}` was executed successfully.\n{command_output}",
+                            )
+                            logging.info(f"Command output: {command_output}")
+                        except asyncio.CancelledError:
+                            logging.info(f"Task cancelled during command execution of '{command_name}' for agent {self.agent_name} in Interactions.execution_agent")
+                            raise # Re-raise to stop further processing in this interaction
+                        except Exception as e:
+                            error_message = f"Error: {self.agent_name} failed to execute command `{command_name}`. {e}"
+                            logging.error(error_message)
+                            c.log_interaction(
+                                role=self.agent_name,
+                                message=f"[SUBACTIVITY][{thinking_id}][ERROR] Failed to execute command `{command_name}`.\n{error_message}",
+                            )
+                            command_output = error_message
+                    # Format the command execution and output
+                    formatted_execution = (
+                        f"<execute>\n"
+                        f"<name>{command_name}</name>\n"
+                        f"{chr(10).join([f'<{k}>{v}</{k}>' for k, v in command_args.items()])}\n"
+                        f"</execute>\n"
+                        f"<output>{command_output}</output>"
+                    )
 
-                # Replace the original command block with the formatted execution and output
-                reformatted_response = reformatted_response.replace(
-                    command_block, formatted_execution, 1
-                )
-                logging.info(f"Command output: {command_output}")
+                    # Replace the original command block with the formatted execution and output
+                    reformatted_response = reformatted_response.replace(
+                        command_block, formatted_execution, 1
+                    )
+                    logging.info(f"Command output: {command_output}")
+            except asyncio.CancelledError: # Catch cancellation if it happens during the loop itself (e.g., between commands)
+                logging.info(f"Task cancelled during command processing loop for agent {self.agent_name} in Interactions.execution_agent")
+                raise # Re-raise
         else:
             cmds = "\n".join(command_list)
             self.response += f"\nThe assistant tried to execute a command, but it was not recognized. Ensure that the correct naming of the commands is being used, they go off of the friendly name. Please choose from the list of available commands and try again:\n{cmds}"
