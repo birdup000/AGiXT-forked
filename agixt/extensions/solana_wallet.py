@@ -7,6 +7,8 @@ from solders.system_program import TransferParams, transfer, ID as SYS_PROGRAM_I
 from solders.pubkey import Pubkey
 from solders.instruction import Instruction
 from solders.message import Message, MessageV0
+import asyncio
+import logging
 import base58
 import requests
 import struct
@@ -146,23 +148,207 @@ class solana_wallet(Extensions):
         self.WSOL_MINT = "So11111111111111111111111111111111111111112"
         self.SOLANA_API_URI = SOLANA_API_URI
         self.client = AsyncClient(SOLANA_API_URI)
+
+        self.wallet_keypair = None
+        self.wallet_address = None
+        self.old_wallet_keypair = None
+        self.old_wallet_address = None
+        self.new_wallet_keypair = None
+        self.new_wallet_address = None
+        
+        generate_new_wallet = False
         WALLET_PRIVATE_KEY = kwargs.get("SOLANA_WALLET_API_KEY", None)
 
         if WALLET_PRIVATE_KEY:
+            secret_bytes = None
             try:
                 # Try hex decoding first
+                secret_bytes = bytes.fromhex(WALLET_PRIVATE_KEY)
+            except ValueError:
+                # If that fails, try base58 decoding
                 try:
-                    secret_bytes = bytes.fromhex(WALLET_PRIVATE_KEY)
-                except ValueError:
-                    # If that fails, try base58 decoding
                     secret_bytes = base58.b58decode(WALLET_PRIVATE_KEY)
+                except Exception:
+                    logging.error(
+                        "Solana Wallet: Failed to decode SOLANA_WALLET_API_KEY from hex or base58."
+                    )
+                    secret_bytes = None # Ensure it's None if decoding fails
+            
+            if secret_bytes:
+                if len(secret_bytes) == 32:
+                    try:
+                        self.wallet_keypair = Keypair.from_seed(secret_bytes)
+                        self.wallet_address = str(self.wallet_keypair.pubkey())
+                        logging.info(
+                            f"Solana Wallet: Successfully loaded wallet {self.wallet_address} from 32-byte seed."
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            f"Solana Wallet: Provided SOLANA_WALLET_API_KEY (32-byte) is an invalid seed: {e}. Will attempt to use as old key for recovery and generate a new wallet."
+                        )
+                        # Try to load it as old_wallet_keypair for potential fund recovery
+                        try:
+                            self.old_wallet_keypair = Keypair.from_seed(secret_bytes) # Re-attempt for old_wallet_keypair specifically
+                            self.old_wallet_address = str(self.old_wallet_keypair.pubkey())
+                            logging.info(f"Solana Wallet: Old wallet {self.old_wallet_address} (from 32-byte seed) retained for potential fund migration.")
+                        except Exception as e_old_seed:
+                            logging.warning(f"Solana Wallet: Could not load old keypair from 32-byte seed for recovery: {e_old_seed}")
+                            self.old_wallet_keypair = None # Ensure it's None
+                        generate_new_wallet = True
+                elif len(secret_bytes) == 64: # Potentially a full secret key
+                    logging.warning(
+                        "Solana Wallet: Provided SOLANA_WALLET_API_KEY is 64 bytes, not a 32-byte seed. Attempting to load as old key for recovery and generating new wallet."
+                    )
+                    try:
+                        # Keypair.from_secret_key expects a 64-byte key where the first 32 are the seed.
+                        # Or, if it's just the private key bytes (32), it can be used directly in Keypair constructor.
+                        # The term "secret key" can be ambiguous. Solders' Keypair constructor takes the first 32 bytes as seed.
+                        # Keypair.from_secret_key takes the full 64 bytes.
+                        self.old_wallet_keypair = Keypair.from_secret_key(secret_bytes)
+                        self.old_wallet_address = str(self.old_wallet_keypair.pubkey())
+                        logging.info(f"Solana Wallet: Old wallet {self.old_wallet_address} (from 64-byte secret) retained for potential fund migration.")
+                    except Exception as e:
+                        logging.warning(
+                            f"Solana Wallet: Could not load keypair from 64-byte secret_bytes: {e}"
+                        )
+                        self.old_wallet_keypair = None # Ensure it's None
+                    generate_new_wallet = True
+                else:
+                    logging.warning(
+                        f"Solana Wallet: Provided SOLANA_WALLET_API_KEY has an invalid length ({len(secret_bytes)} bytes). Expected 32-byte seed or 64-byte secret key. Generating a new wallet."
+                    )
+                    # Attempt to load as old_wallet_keypair if possible, e.g. if it's a malformed key that Keypair can somehow handle
+                    # This is a long shot but tries to preserve any potential access
+                    try:
+                        # Try with first 32 bytes if longer than 32, but not 64
+                        if len(secret_bytes) > 32:
+                             self.old_wallet_keypair = Keypair(secret_bytes[:32])
+                        else: # Or if shorter, try as is (likely to fail)
+                             self.old_wallet_keypair = Keypair(secret_bytes)
+                        self.old_wallet_address = str(self.old_wallet_keypair.pubkey())
+                        logging.info(f"Solana Wallet: Old wallet {self.old_wallet_address} (from potentially malformed key) retained for fund migration attempt.")
+                    except Exception:
+                        logging.warning("Solana Wallet: Could not make any use of the provided secret_bytes for an old wallet.")
+                        self.old_wallet_keypair = None
+                    generate_new_wallet = True
+            else: # secret_bytes is None due to decoding failure
+                # This case is already logged above where decoding is attempted.
+                generate_new_wallet = True
+        else:
+            logging.info("Solana Wallet: No SOLANA_WALLET_API_KEY provided. Generating a new wallet.")
+            generate_new_wallet = True
 
-                self.wallet_keypair = Keypair.from_seed(secret_bytes)
-                self.wallet_address = str(self.wallet_keypair.pubkey())
-            except Exception as e:
-                print(f"Error initializing wallet: {e}")
-                self.wallet_keypair = None
-                self.wallet_address = None
+        if generate_new_wallet:
+            self.new_wallet_keypair = Keypair() # Keypair.generate() is the default constructor
+            self.new_wallet_address = str(self.new_wallet_keypair.pubkey())
+            
+            # Use the seed for the private key string, as it's 32 bytes and suitable for from_seed
+            new_private_key_seed_bytes = self.new_wallet_keypair.seed
+            new_private_key_string = base58.b58encode(new_private_key_seed_bytes).decode("utf-8")
+
+            logging.warning("######################################################################################")
+            logging.warning("IMPORTANT: Solana Wallet Update Required!")
+            logging.warning("Your previous Solana wallet key was invalid, not provided, or not a 32-byte seed.")
+            logging.warning("A new wallet has been generated to ensure functionality.")
+            logging.warning(f"New Public Key: {self.new_wallet_address}")
+            logging.warning("---")
+            logging.warning("PLEASE SAVE THIS NEW PRIVATE KEY SEED AND UPDATE YOUR SOLANA_WALLET_API_KEY CONFIGURATION:")
+            logging.warning(f"{new_private_key_string}")
+            logging.warning("---")
+            logging.warning("Failure to save and update this new private key seed may result in PERMANENT LOSS OF ACCESS to this new wallet and its funds.")
+            
+            # Schedule fund migration if an old wallet exists
+            if self.old_wallet_keypair and self.old_wallet_address:
+                logging.info(
+                    f"Solana Wallet: Scheduling fund migration from old wallet {self.old_wallet_address} "
+                    f"to new wallet {self.new_wallet_address}."
+                )
+                asyncio.create_task(self._migrate_funds(
+                    old_keypair=self.old_wallet_keypair,
+                    old_address_str=str(self.old_wallet_address),
+                    new_address_str=str(self.new_wallet_address)
+                ))
+            else:
+                logging.info("Solana Wallet: No valid old wallet keypair found to migrate funds from.")
+
+            # Set the new wallet as the active wallet
+            logging.info(f"Solana Wallet: Setting active wallet to newly generated wallet: {self.new_wallet_address}")
+            self.wallet_keypair = self.new_wallet_keypair
+            self.wallet_address = self.new_wallet_address
+            
+            # The logging warning block below already covers the user instruction for the new key.
+            # It is part of the "IMPORTANT: Solana Wallet Update Required!" message.
+            # No need to add a duplicate logging.warning here about the new key.
+            logging.warning("######################################################################################")
+
+    async def _migrate_funds(self, old_keypair: Keypair, old_address_str: str, new_address_str: str):
+        """
+        Attempts to transfer all SOL (minus fees) from an old wallet to a new wallet.
+        """
+        logging.info(
+            f"Solana Wallet: Attempting to migrate funds from old wallet {old_address_str} to new wallet {new_address_str}."
+        )
+
+        try:
+            old_address = Pubkey.from_string(old_address_str)
+            new_address = Pubkey.from_string(new_address_str)
+
+            # Check Old Wallet Balance
+            balance_response = await self.client.get_balance(old_address, commitment=Confirmed)
+            balance_lamports = balance_response.value
+            logging.info(f"Solana Wallet: Old wallet {old_address_str} balance: {balance_lamports / 1_000_000_000} SOL.")
+
+            # Determine Transaction Fee
+            FEE_LAMPORTS = 5000  # Typical Solana transaction fee
+
+            # Check if Transfer is Viable
+            if balance_lamports <= FEE_LAMPORTS:
+                logging.info(
+                    f"Solana Wallet: Balance in old wallet {old_address_str} ({balance_lamports / 1_000_000_000} SOL) "
+                    f"is insufficient to cover transaction fees ({FEE_LAMPORTS / 1_000_000_000} SOL). No funds will be transferred."
+                )
+                return
+
+            # Calculate Amount to Transfer
+            lamports_to_transfer = balance_lamports - FEE_LAMPORTS
+            logging.info(f"Solana Wallet: Attempting to transfer {lamports_to_transfer / 1_000_000_000} SOL.")
+
+
+            # Construct and Send Transaction
+            transfer_ix = transfer(
+                TransferParams(
+                    from_pubkey=old_address,
+                    to_pubkey=new_address,
+                    lamports=lamports_to_transfer,
+                )
+            )
+
+            blockhash_response = await self.client.get_latest_blockhash(commitment=Confirmed)
+            recent_blockhash = blockhash_response.value.blockhash
+
+            msg = MessageV0.try_compile(
+                payer=old_address,  # Payer is the old address
+                instructions=[transfer_ix],
+                address_lookup_table_accounts=[],
+                recent_blockhash=recent_blockhash,
+            )
+
+            # CRITICAL: Use old_keypair
+            tx = VersionedTransaction(msg, [old_keypair]) 
+
+            opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
+            response = await self.client.send_transaction(tx, opts=opts)
+            tx_signature = response.value
+
+            logging.info(
+                f"Solana Wallet: Successfully transferred {lamports_to_transfer / 1_000_000_000} SOL "
+                f"from old wallet {old_address_str} to new wallet {new_address_str}. "
+                f"Transaction signature: {tx_signature}"
+            )
+
+        except Exception as e:
+            logging.error(f"Solana Wallet: Error during fund migration from {old_address_str} to {new_address_str}: {str(e)}")
+
 
         self.commands = {
             "Get Solana Wallet Balance": self.get_wallet_balance,
